@@ -10,6 +10,10 @@ use kernel::prelude::*;
 use kernel::error::*;
 use kernel::types::Opaque;
 
+const USB_INTERFACE_CLASS_HID: u8 = 3;
+const USB_INTERFACE_SUBCLASS_BOOT: u8 = 1;
+const USB_INTERFACE_PROTOCOL_KEYBOARD: u8 = 1;
+
 macro_rules! module_device_table {
     ($type:ty, $name:ident) => {
         #[no_mangle]
@@ -134,6 +138,18 @@ impl UsbDeviceId {
 
         unsafe {&mut *ptr}
     }
+
+    fn usb_interface_info(interface_class: u8, interface_subclass: u8, interface_protocol: u8) -> Self {
+        Self {
+            Opaque: Opaque::new(bindings::usb_device_id {bInterfaceClass: interface_class, bInterfaceSubclass: interface_subclass, bInterfaceProtocol: interface_protocol,}),
+        }
+    }
+
+    fn new() -> Self {
+        Self {
+            Opaque: Opaque::new(),
+        }
+    }
 }
 
 pub enum PmMessage {}
@@ -142,7 +158,7 @@ struct Keyboard;
 
 impl UsbDriverTrait for Keyboard {
     const Name: &'static CStr = c_str!("UsbDriverTest");
-    const ID_TABLE: Box[UsbDeviceId] =
+    const ID_TABLE: Box<[UsbDeviceId]> = Box::new([UsbDeviceId::usb_interface_info(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT, USB_INTERFACE_PROTOCOL_KEYBOARD), UsbDeviceId::new()]);
 }
 
 #[vtable]
