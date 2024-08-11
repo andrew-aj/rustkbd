@@ -6,6 +6,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
 use kernel::bindings;
+use kernel::c_str;
 use kernel::prelude::*;
 use kernel::error::*;
 use kernel::types::Opaque;
@@ -14,14 +15,7 @@ const USB_INTERFACE_CLASS_HID: u8 = 3;
 const USB_INTERFACE_SUBCLASS_BOOT: u8 = 1;
 const USB_INTERFACE_PROTOCOL_KEYBOARD: u8 = 1;
 
-macro_rules! module_device_table {
-    ($type:ty, $name:ident) => {
-        #[no_mangle]
-        pub static __mod_{$type}__{$name}_device_table: *const $type = &$name as *const _;
-    };
-}
-
-pub const fn create_usb_driver<T: UsbDriver>() -> UsbDriver {
+pub const fn create_usb_driver<T: UsbDriverTrait>() -> UsbDriver {
     UsbDriver(Opaque::new(bindings::usb_driver {
 
     }))
@@ -32,13 +26,15 @@ struct Module {
 }
 
 pub struct UsbRegistration{
-    driver: Pin<&'static mut UsbDriver>
+    driver: Pin<UsbDriver>
 }
 
 impl UsbRegistration {
-    pub fn register(module: &'static kernel::ThisModule, driver: Pin<&'static mut UsbDriver>) -> Result<Self> {
+    pub fn register(module: &'static kernel::ThisModule) -> Result<Self> {
+        let driver = create_usb_driver::<Keyboard>();
+
         to_result(unsafe {
-            bindings::usb_register_driver(driver.0.get(), &mut kernel::bindings::__this_module as *mut _, b"rust".as_ptr() as *const i8)
+            bindings::usb_register_driver(driver.0.get(), module as *mut _, b"rust".as_ptr() as *const i8)
         })?;
 
         Ok(UsbRegistration { driver })
@@ -63,6 +59,22 @@ impl<T: UsbDriverTrait> UsbAdapter<T> {
             let _intf = unsafe {UsbInterface::from_raw(intf)};
             let _id = unsafe {UsbDeviceId::from_raw(id)};
             T::probe(_intf, _id)?;
+            Ok(0)
+        })
+    }
+
+    unsafe extern "C" fn disconnect_callback(intf: *mut bindings::usb_interface) -> core::ffi::c_int {
+        kernel::error::from_result(|| {
+            let _intf = unsafe {UsbInterface::from_raw(intf)};
+            T::probe(_intf);
+            Ok(0)
+        })
+    }
+
+    unsafe extern "C" fn unlocked_ioctl_callback(intf: *mut bindings::usb_interface, code: i32, buf: &[u8]) -> core::ffi::c_int {
+        kernel::error::from_result(|| {
+            let _intf = unsafe {UsbInterface::from_raw(intf)};
+            T::unlocked_ioctl(_intf, code, buf);
             Ok(0)
         })
     }
@@ -120,6 +132,8 @@ pub static __rust_out_of_tree_0: [u8; 12] = *b"license=GPL\0";
 
 pub struct UsbDriver(Opaque<bindings::usb_driver>);
 
+unsafe impl Sync for UsbDriver {}
+
 pub struct UsbInterface(Opaque<bindings::usb_interface>);
 
 impl UsbInterface {
@@ -130,7 +144,10 @@ impl UsbInterface {
     }
 }
 
-pub struct UsbDeviceId(Opaque<bindings::usb_device_id>);
+#[repr(C)]
+pub struct UsbDeviceId(bindings::usb_device_id);
+
+unsafe impl Sync for UsbDeviceId {}
 
 impl UsbDeviceId {
     unsafe fn from_raw<'a>(ptr: *mut bindings::usb_device_id) -> &'a mut Self {
@@ -139,17 +156,53 @@ impl UsbDeviceId {
         unsafe {&mut *ptr}
     }
 
-    fn usb_interface_info(interface_class: u8, interface_subclass: u8, interface_protocol: u8) -> Self {
-        Self {
-            Opaque: Opaque::new(bindings::usb_device_id {bInterfaceClass: interface_class, bInterfaceSubclass: interface_subclass, bInterfaceProtocol: interface_protocol,}),
-        }
+    const fn usb_interface_info(interface_class: u8, interface_subclass: u8, interface_protocol: u8) -> Self {
+        Self(usb_device_interface_info(interface_class, interface_subclass, interface_protocol))
     }
 
-    fn new() -> Self {
-        Self {
-            Opaque: Opaque::new(),
-        }
+    const fn default() -> Self {
+        Self(usb_device_default())
     }
+}
+
+const fn usb_device_interface_info(interface_class: u8, interface_subclass: u8, interface_protocol: u8) -> bindings::usb_device_id {
+    let mut dev = bindings::usb_device_id {
+        match_flags: 0,
+        idVendor: 0,
+        idProduct: 0,
+        bcdDevice_lo: 0,
+        bcdDevice_hi: 0,
+        bDeviceClass: 0,
+        bDeviceSubClass: 0,
+        bDeviceProtocol: 0,
+        bInterfaceClass: 0,
+        bInterfaceSubClass: 0,
+        bInterfaceProtocol: 0,
+        bInterfaceNumber: 0,
+        driver_info: 0,
+        };
+    dev.bInterfaceClass = interface_class;
+    dev.bInterfaceSubClass = interface_subclass;
+    dev.bInterfaceProtocol = interface_protocol;
+    dev
+}
+
+const fn usb_device_default() -> bindings::usb_device_id {
+   bindings::usb_device_id {
+        match_flags: 0,
+        idVendor: 0,
+        idProduct: 0,
+        bcdDevice_lo: 0,
+        bcdDevice_hi: 0,
+        bDeviceClass: 0,
+        bDeviceSubClass: 0,
+        bDeviceProtocol: 0,
+        bInterfaceClass: 0,
+        bInterfaceSubClass: 0,
+        bInterfaceProtocol: 0,
+        bInterfaceNumber: 0,
+        driver_info: 0,
+        }
 }
 
 pub enum PmMessage {}
@@ -157,15 +210,21 @@ pub enum PmMessage {}
 struct Keyboard;
 
 impl UsbDriverTrait for Keyboard {
-    const Name: &'static CStr = c_str!("UsbDriverTest");
-    const ID_TABLE: Box<[UsbDeviceId]> = Box::new([UsbDeviceId::usb_interface_info(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT, USB_INTERFACE_PROTOCOL_KEYBOARD), UsbDeviceId::new()]);
+    fn new() -> Self {
+        Self {
+            Name: c_str!("UsbDriverTest"),
+        }
+    }
 }
+
+#[no_mangle]
+pub static __mod_usb_usb_kbd_id_table_device_table: [UsbDeviceId; 2] = [UsbDeviceId::usb_interface_info(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT, USB_INTERFACE_PROTOCOL_KEYBOARD), UsbDeviceId::default()];
 
 #[vtable]
 pub trait UsbDriverTrait {
-    const NAME: &'static CStr;
+    NAME: &'static CStr;
 
-    const ID_TABLE: Box<[UsbDeviceId]>;
+    fn new() -> Self;
 
     fn probe(intf: &mut UsbInterface, id: &mut UsbDeviceId) -> Result {
         kernel::build_error!(VTABLE_DEFAULT_ERROR)
@@ -201,21 +260,11 @@ pub trait UsbDriverTrait {
 
 
 impl kernel::Module for Module {
-    static mut DRIVER: UsbDriver = create_usb_driver<Keyboard>();
-
     fn init(_module: &'static ThisModule) -> Result<Self> {
         pr_info!("Rust usb driver init");
 
-        let driver = unsafe {&mut DRIVER};
-        let mut reg = UsbRegistration::register(_module, Pin::static_mut(driver))?;
+        let mut reg = UsbRegistration::register(_module)?;
 
-        Ok(Modue{ _reg: reg})
-    }
-}
-
-impl Drop for RustOutOfTree {
-    fn drop(&mut self) {
-        pr_info!("My numbers are {:?}\n", self.numbers);
-        pr_info!("Rust out-of-tree sample (exit)\n");
+        Ok(Module{ _reg: reg})
     }
 }
